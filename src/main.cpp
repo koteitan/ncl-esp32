@@ -11,9 +11,20 @@
 #include "../secrets.h"
 #include <rom/miniz.h>
 #include <webp/decode.h>
-#include "stb_image.h"
+// libjpeg for progressive JPEG (1/8 scale decode)
+// Must match libjpeg's boolean=int to ensure struct size consistency
+#define HAVE_BOOLEAN
+typedef int jpeg_boolean;  // avoid conflict with Arduino's boolean
+// Temporarily redefine boolean for jpeglib.h inclusion
+#pragma push_macro("boolean")
+#undef boolean
+#define boolean int
+extern "C" {
+#include "jpeglib.h"
+}
+#pragma pop_macro("boolean")
 
-#define VERSION "v1.3.0"
+#define VERSION "v1.4.0"
 #define RELAY_HOST "yabu.me"
 #define RELAY_PORT 443
 #define RELAY_PATH "/"
@@ -392,7 +403,9 @@ bool downloadIcon(MetaEntry* meta) {
   http.setTimeout(5000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  if (!http.begin(client, meta->pictureUrl)) {
+  // デバッグ: プログレッシブJPEG固定 (800x800, 29KB)
+  String debugUrl = "https://image.nostr.build/4c2099ee031cd17e00db5bdbfd6bd01181229039d8567afe64ea7ffda76cd3d1.jpg";
+  if (!http.begin(client, debugUrl)) {
     Serial.printf("[ICON] http.begin failed: %s\n", meta->pictureUrl.c_str());
     meta->iconFailed = true;
     iconPoolUsed[poolIdx] = false;
@@ -475,36 +488,48 @@ bool downloadIcon(MetaEntry* meta) {
     }
     Serial.printf("[JPEG] original: %dx%d%s\n", jpgW, jpgH, progressiveJpeg ? " (progressive)" : "");
     if (progressiveJpeg) {
-      Serial.println("[JPEG] progressive - using stb_image");
-      // stb_imageでデコード
-      int stbW, stbH, stbCh;
-      uint8_t* stbData = stbi_load_from_memory(imgBuf, totalRead, &stbW, &stbH, &stbCh, 3);
-      if (!stbData) {
-        Serial.printf("[JPEG] stb decode failed: %s\n", stbi_failure_reason());
-        free(imgBuf);
-        sprite.deleteSprite();
-        meta->iconFailed = true;
-        iconPoolUsed[poolIdx] = false;
-        return false;
-      }
-      Serial.printf("[JPEG] stb decoded: %dx%d ch=%d\n", stbW, stbH, stbCh);
-      free(imgBuf);
-      // Spriteを適切なサイズに
+      Serial.printf("[JPEG] progressive - using libjpeg 1/8 scale, heap=%d psram=%d\n", ESP.getFreeHeap(), ESP.getFreePsram());
+      // libjpeg: メモリソースからデコード（1/8スケール）
+      struct jpeg_decompress_struct cinfo;
+      struct jpeg_error_mgr jerr;
+      cinfo.err = jpeg_std_error(&jerr);
+      jpeg_create_decompress(&cinfo);
+      jpeg_mem_src(&cinfo, imgBuf, totalRead);
+      jpeg_read_header(&cinfo, TRUE);
+      // 1/8スケールデコード（800x800→100x100等）
+      cinfo.scale_num = 1;
+      cinfo.scale_denom = 8;
+      cinfo.out_color_space = JCS_RGB;
+      jpeg_start_decompress(&cinfo);
+      int outW = cinfo.output_width;
+      int outH = cinfo.output_height;
+      int outCh = cinfo.output_components;
+      Serial.printf("[JPEG] libjpeg scaled: %dx%d ch=%d\n", outW, outH, outCh);
+      // スキャンライン読み取り → Spriteに直接描画
       sprite.deleteSprite();
-      spriteSize = min(max(stbW, stbH), 128);
+      spriteSize = min(max(outW, outH), 128);
       sprite.createSprite(spriteSize, spriteSize);
       sprite.fillSprite(BLACK);
-      // RGB→Spriteに描画（ニアレストネイバー縮小）
-      for (int dy = 0; dy < spriteSize; dy++) {
-        int srcY = dy * stbH / spriteSize;
-        for (int dx = 0; dx < spriteSize; dx++) {
-          int srcX = dx * stbW / spriteSize;
-          int idx = (srcY * stbW + srcX) * 3;
-          sprite.drawPixel(dx, dy, sprite.color565(stbData[idx], stbData[idx+1], stbData[idx+2]));
+      uint8_t* rowBuf = (uint8_t*)malloc(outW * outCh);
+      if (rowBuf) {
+        int dy = 0;
+        while (cinfo.output_scanline < cinfo.output_height) {
+          JSAMPROW row = rowBuf;
+          jpeg_read_scanlines(&cinfo, &row, 1);
+          if (dy < spriteSize) {
+            for (int dx = 0; dx < min(outW, spriteSize); dx++) {
+              int idx = dx * outCh;
+              sprite.drawPixel(dx, dy, sprite.color565(rowBuf[idx], rowBuf[idx+1], rowBuf[idx+2]));
+            }
+          }
+          dy++;
+          if (dy % 20 == 0) yield();
         }
-        if (dy % 20 == 0) yield();
+        free(rowBuf);
       }
-      stbi_image_free(stbData);
+      jpeg_finish_decompress(&cinfo);
+      jpeg_destroy_decompress(&cinfo);
+      free(imgBuf);
       // リサンプル→iconPoolへ（以降の共通処理に流す）
       goto resample_to_icon;
     }

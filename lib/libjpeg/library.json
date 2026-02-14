@@ -1,0 +1,8 @@
+{
+  "name": "libjpeg",
+  "version": "9f",
+  "build": {
+    "srcDir": "src",
+    "flags": ["-DHAVE_PROTOTYPES", "-Wno-shift-negative-value", "-Wno-maybe-uninitialized"]
+  }
+}
