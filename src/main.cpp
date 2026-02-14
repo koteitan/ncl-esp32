@@ -295,7 +295,7 @@ void drawHeader() {
   M5.Lcd.setTextColor(WHITE);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setCursor(10, 6);
-  M5.Lcd.print("ncl-core2");
+  M5.Lcd.print("noscli-core2");
   M5.Lcd.setTextSize(1);
   M5.Lcd.setTextColor(CYAN);
   M5.Lcd.setCursor(150, 10);
@@ -598,7 +598,7 @@ void setup() {
   setupWebOTA();
   
   M5.Lcd.fillRect(0, 30, 320, 200, BLACK);
-  efontDrawString(30, 50, String("Nostr Client for M5Stack"), WHITE, 280, 1);
+  efontDrawString(30, 50, String("noscli-core2"), WHITE, 280, 1);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(CYAN);
   M5.Lcd.setCursor(30, 100);
