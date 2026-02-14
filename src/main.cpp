@@ -11,6 +11,7 @@
 #include "../secrets.h"
 #include <rom/miniz.h>
 #include <setjmp.h>
+#include <mbedtls/base64.h>
 #include <webp/decode.h>
 // libjpeg for progressive JPEG (1/8 scale decode)
 // Must match libjpeg's boolean=int to ensure struct size consistency
@@ -422,6 +423,57 @@ bool downloadIcon(MetaEntry* meta) {
 
   int poolIdx = allocIconPool();
   if (poolIdx < 0) return false; // プール満杯
+
+  // data: URI対応 (Base64埋め込み画像)
+  Serial.printf("[ICON] url prefix: %.20s\n", meta->pictureUrl.c_str());
+  if (meta->pictureUrl.startsWith("data:image/")) {
+    int b64Start = meta->pictureUrl.indexOf("base64,");
+    if (b64Start < 0) { meta->iconFailed = true; iconPoolUsed[poolIdx] = false; return false; }
+    b64Start += 7; // "base64," の後
+    String b64 = meta->pictureUrl.substring(b64Start);
+    // Base64デコード（ESP32のmbedtlsを使用）
+    size_t b64Len = b64.length();
+    size_t outLen = (b64Len * 3) / 4 + 4;
+    uint8_t* imgBuf = (uint8_t*)malloc(outLen);
+    if (!imgBuf) { meta->iconFailed = true; iconPoolUsed[poolIdx] = false; return false; }
+    size_t actualLen = 0;
+    int ret = mbedtls_base64_decode(imgBuf, outLen, &actualLen, (const uint8_t*)b64.c_str(), b64Len);
+    if (ret != 0) {
+      Serial.printf("[ICON] base64 decode failed: %d\n", ret);
+      free(imgBuf); meta->iconFailed = true; iconPoolUsed[poolIdx] = false; return false;
+    }
+    Serial.printf("[ICON] data: URI decoded %d bytes\n", actualLen);
+    // 以降のデコード処理へ（imgBuf, totalRead を設定してジャンプ）
+    int totalRead = actualLen;
+    // Sprite作成
+    TFT_eSprite sprite = TFT_eSprite(&M5.Lcd);
+    int spriteSize = 128;
+    sprite.createSprite(spriteSize, spriteSize);
+    sprite.fillSprite(BLACK);
+    Serial.printf("[ICON] format: %02X %02X, size: %d, url: data:...\n", imgBuf[0], imgBuf[1], totalRead);
+    // PNG判定
+    if (imgBuf[0] == 0x89 && imgBuf[1] == 0x50) {
+      if (!decodePngToSprite(imgBuf, totalRead, sprite, spriteSize)) {
+        free(imgBuf); sprite.deleteSprite(); meta->iconFailed = true; iconPoolUsed[poolIdx] = false; return false;
+      }
+    } else {
+      // 非PNG data: URI（JPEG等）→ drawJpg試行
+      sprite.drawJpg(imgBuf, totalRead, 0, 0, spriteSize, spriteSize);
+    }
+    free(imgBuf);
+    // iconPoolへコピー
+    for (int y = 0; y < ICON_SIZE; y++) {
+      for (int x = 0; x < ICON_SIZE; x++) {
+        int srcX = x * spriteSize / ICON_SIZE;
+        int srcY = y * spriteSize / ICON_SIZE;
+        uint16_t px = sprite.readPixel(srcX, srcY);
+        iconPool[poolIdx][y * ICON_SIZE + x] = (px >> 8) | (px << 8);
+      }
+    }
+    sprite.deleteSprite();
+    meta->iconPoolIdx = poolIdx;
+    return true;
+  }
 
   // HTTPS画像ダウンロード
   WiFiClientSecure client;
