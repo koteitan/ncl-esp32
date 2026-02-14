@@ -26,6 +26,13 @@ extern void * malloc JPP((size_t size));
 extern void free JPP((void *ptr));
 #endif
 
+/* ESP32: Use PSRAM for libjpeg allocations (progressive JPEG needs lots of memory) */
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#define JPEG_MALLOC(sz) heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
+#define JPEG_MALLOC(sz) malloc(sz)
+#endif
 
 /*
  * Memory allocation and freeing are controlled by the regular library
@@ -35,7 +42,7 @@ extern void free JPP((void *ptr));
 GLOBAL(void *)
 jpeg_get_small (j_common_ptr cinfo, size_t sizeofobject)
 {
-  return (void *) malloc(sizeofobject);
+  return (void *) JPEG_MALLOC(sizeofobject);
 }
 
 GLOBAL(void)
@@ -47,15 +54,12 @@ jpeg_free_small (j_common_ptr cinfo, void * object, size_t sizeofobject)
 
 /*
  * "Large" objects are treated the same as "small" ones.
- * NB: although we include FAR keywords in the routine declarations,
- * this file won't actually work in 80x86 small/medium model; at least,
- * you probably won't be able to process useful-size images in only 64KB.
  */
 
 GLOBAL(void FAR *)
 jpeg_get_large (j_common_ptr cinfo, size_t sizeofobject)
 {
-  return (void FAR *) malloc(sizeofobject);
+  return (void FAR *) JPEG_MALLOC(sizeofobject);
 }
 
 GLOBAL(void)

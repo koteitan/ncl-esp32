@@ -10,6 +10,7 @@
 #include "efont.h"
 #include "../secrets.h"
 #include <rom/miniz.h>
+#include <setjmp.h>
 #include <webp/decode.h>
 // libjpeg for progressive JPEG (1/8 scale decode)
 // Must match libjpeg's boolean=int to ensure struct size consistency
@@ -403,9 +404,7 @@ bool downloadIcon(MetaEntry* meta) {
   http.setTimeout(5000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  // デバッグ: プログレッシブJPEG固定 (800x800, 29KB)
-  String debugUrl = "https://image.nostr.build/4c2099ee031cd17e00db5bdbfd6bd01181229039d8567afe64ea7ffda76cd3d1.jpg";
-  if (!http.begin(client, debugUrl)) {
+  if (!http.begin(client, meta->pictureUrl)) {
     Serial.printf("[ICON] http.begin failed: %s\n", meta->pictureUrl.c_str());
     meta->iconFailed = true;
     iconPoolUsed[poolIdx] = false;
@@ -492,7 +491,27 @@ bool downloadIcon(MetaEntry* meta) {
       // libjpeg: メモリソースからデコード（1/8スケール）
       struct jpeg_decompress_struct cinfo;
       struct jpeg_error_mgr jerr;
-      cinfo.err = jpeg_std_error(&jerr);
+      // setjmpでエラーをキャッチ（libjpegデフォルトはabort→リブート）
+      struct JpegErrorMgr { struct jpeg_error_mgr pub; jmp_buf jmpBuf; };
+      JpegErrorMgr errMgr;
+      cinfo.err = jpeg_std_error(&errMgr.pub);
+      errMgr.pub.error_exit = [](j_common_ptr ci) {
+        JpegErrorMgr* myerr = (JpegErrorMgr*)ci->err;
+        char buf[JMSG_LENGTH_MAX];
+        ci->err->format_message(ci, buf);
+        Serial.printf("[JPEG] libjpeg error: %s\n", buf);
+        longjmp(myerr->jmpBuf, 1);
+      };
+      if (setjmp(errMgr.jmpBuf)) {
+        // エラー発生時
+        Serial.println("[JPEG] libjpeg decode failed, skipping");
+        jpeg_destroy_decompress(&cinfo);
+        free(imgBuf);
+        sprite.deleteSprite();
+        meta->iconFailed = true;
+        iconPoolUsed[poolIdx] = false;
+        return false;
+      }
       jpeg_create_decompress(&cinfo);
       jpeg_mem_src(&cinfo, imgBuf, totalRead);
       jpeg_read_header(&cinfo, TRUE);
@@ -884,8 +903,8 @@ void processIconDownload() {
     }
   }
 
-  // metaCache全体から未取得のものを1枚ずつダウンロード
-  for (int i = 0; i < metaCacheCount; i++) {
+  // metaCache全体から未取得のものを1枚ずつダウンロード（新しい方から＝スタック型）
+  for (int i = metaCacheCount - 1; i >= 0; i--) {
     MetaEntry* meta = &metaCache[i];
     if (meta->pictureUrl.length() > 0 && meta->iconPoolIdx < 0 && !meta->iconFailed) {
       drawIconStatusBar();
