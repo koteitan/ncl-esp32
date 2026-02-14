@@ -66,11 +66,3 @@
 ### chunked transfer encoding
 - **問題**: `getString()` がぬるバイトで切断、`getStream()` がchunkedデコードしない
 - **対処**: カスタム `BufStream` クラス + `writeToStream()` でバイナリ安全にダウンロード
-
-### data: URI画像が表示されない
-- **問題**: `if (length > 4096) return;` のペイロード制限でbase64画像入りkind:0イベント(約5KB)がサイレントにドロップ
-- **対処**: 制限を16384に拡大
-
-### 切り詰めPNG
-- **問題**: IDATチャンクの宣言サイズよりファイルが短い壊れたPNGでデコーダがreturn false
-- **対処**: 読める分だけ読んで部分デコード。0行もデコードできなかった場合のみ失敗
