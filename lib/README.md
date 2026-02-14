@@ -21,6 +21,15 @@
   - Encoder and platform-specific SIMD files excluded via `library.json` srcFilter
   - `utils.c`: uses PSRAM via `heap_caps_malloc/calloc(MALLOC_CAP_SPIRAM)` for internal decode buffers (1105x1105 images need several MB)
 
+## 画像デコーダ一覧
+
+| 形式 | デコーダ | 自作/外部 | 備考 |
+|---|---|---|---|
+| JPEG (baseline) | M5Stack `drawJpg` | 外部 (M5内蔵) | SOFマーカー解析で1/1〜1/8自動スケール |
+| JPEG (progressive) | IJG libjpeg 9f | 外部 (ESP32にポーティング) | 1/8スケールデコード、≤1000px |
+| PNG | tinfl (inflate) + 自作パーサ | **自作** | IHDRパース、IDAT結合、フィルタ復元(5種)、パレット対応、ストリーミングデコード |
+| WebP | Google libwebp 1.5.0 | 外部 (ESP32にポーティング) | `use_scaling` で直接32x32デコード |
+
 ## Image format support summary
 
 | Format | Method | Max size | Notes |
