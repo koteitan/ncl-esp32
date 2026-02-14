@@ -9,6 +9,8 @@
 #include "efontEnableJaMini.h"
 #include "efont.h"
 #include "../secrets.h"
+#include <rom/miniz.h>
+#include <webp/decode.h>
 
 #define VERSION "v1.2.2"
 #define RELAY_HOST "yabu.me"
@@ -116,7 +118,7 @@ void addMeta(const String& pubkey, const String& displayName, const String& pict
 void requestMeta(const String& pubkey) {
   if (findMeta(pubkey)) return;
   addMeta(pubkey, "", "");
-  
+
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   arr.add("REQ");
@@ -132,47 +134,289 @@ void requestMeta(const String& pubkey) {
   webSocket.sendTXT(msg);
 }
 
+// --- WebP デコーダ (libwebp, スケーリング対応) ---
+bool decodeWebpToSprite(const uint8_t* data, int dataLen, TFT_eSprite& sprite, int spriteSize) {
+  int w, h;
+  if (!WebPGetInfo(data, dataLen, &w, &h)) {
+    Serial.println("[WEBP] GetInfo failed");
+    return false;
+  }
+  Serial.printf("[WEBP] %dx%d, heap=%d\n", w, h, ESP.getFreeHeap());
+
+  // スケーリングデコード: spriteSize以下に縮小
+  WebPDecoderConfig config;
+  if (!WebPInitDecoderConfig(&config)) { Serial.println("[WEBP] init config failed"); return false; }
+
+  config.options.use_scaling = 1;
+  // 直接ICON_SIZE(32x32)にスケーリング → ヒープ節約
+  int targetSize = ICON_SIZE; // 32
+  int scaledW = (w <= targetSize) ? w : targetSize;
+  int scaledH = (h <= targetSize) ? h : targetSize;
+  // アスペクト比維持
+  if (w > h) { scaledH = h * targetSize / w; }
+  else { scaledW = w * targetSize / h; }
+  if (scaledW < 1) scaledW = 1;
+  if (scaledH < 1) scaledH = 1;
+  config.options.scaled_width = scaledW;
+  config.options.scaled_height = scaledH;
+  config.output.colorspace = MODE_RGB;
+
+  size_t outSize = scaledW * scaledH * 3;
+  Serial.printf("[WEBP] scaling to %dx%d (%d bytes), psram=%d\n", scaledW, scaledH, outSize, ESP.getFreePsram());
+
+  VP8StatusCode status = WebPDecode(data, dataLen, &config);
+  if (status != VP8_STATUS_OK) { Serial.printf("[WEBP] decode failed: %d\n", status); WebPFreeDecBuffer(&config.output); return false; }
+
+  uint8_t* rgb = config.output.u.RGBA.rgba;
+  int stride = config.output.u.RGBA.stride;
+  for (int y = 0; y < scaledH; y++) {
+    for (int x = 0; x < scaledW; x++) {
+      int idx = y * stride + x * 3;
+      sprite.drawPixel(x, y, sprite.color565(rgb[idx], rgb[idx+1], rgb[idx+2]));
+    }
+    yield();
+  }
+
+  WebPFreeDecBuffer(&config.output);
+  Serial.println("[WEBP] decode OK");
+  return true;
+}
+
+// --- PNG デコーダ (自作) ---
+// imgBuf: PNGファイルデータ, imgLen: データ長
+// sprite: デコード先Sprite (createSprite済み, spriteSize x spriteSize)
+// 成功時true
+bool decodePngToSprite(const uint8_t* imgBuf, int imgLen, TFT_eSprite& sprite, int spriteSize) {
+  // PNGシグネチャ確認
+  const uint8_t pngSig[] = {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A};
+  if (imgLen < 33 || memcmp(imgBuf, pngSig, 8) != 0) { Serial.println("[PNG] bad signature"); return false; }
+
+  // IHDRチャンク解析 (offset 8)
+  int pos = 8;
+  // chunk length (4) + "IHDR" (4) + data (13) + CRC (4)
+  uint32_t ihdrLen = (imgBuf[pos]<<24)|(imgBuf[pos+1]<<16)|(imgBuf[pos+2]<<8)|imgBuf[pos+3];
+  if (ihdrLen != 13 || memcmp(imgBuf+pos+4, "IHDR", 4) != 0) { Serial.printf("[PNG] bad IHDR len=%d\n", ihdrLen); return false; }
+  pos += 8; // skip length + type
+  uint32_t pngW = (imgBuf[pos]<<24)|(imgBuf[pos+1]<<16)|(imgBuf[pos+2]<<8)|imgBuf[pos+3]; pos+=4;
+  uint32_t pngH = (imgBuf[pos]<<24)|(imgBuf[pos+1]<<16)|(imgBuf[pos+2]<<8)|imgBuf[pos+3]; pos+=4;
+  uint8_t bitDepth = imgBuf[pos++];
+  uint8_t colorType = imgBuf[pos++];
+  uint8_t compression = imgBuf[pos++];
+  uint8_t filter = imgBuf[pos++];
+  uint8_t interlace = imgBuf[pos++];
+  pos += 4; // CRC
+
+  Serial.printf("[PNG] %dx%d depth=%d color=%d interlace=%d\n", pngW, pngH, bitDepth, colorType, interlace);
+  if ((bitDepth != 8 && bitDepth != 4 && bitDepth != 2 && bitDepth != 1) || interlace != 0) { Serial.println("[PNG] unsupported depth/interlace"); return false; }
+  if (colorType != 0 && colorType != 2 && colorType != 3 && colorType != 6) { Serial.printf("[PNG] unsupported colorType=%d\n", colorType); return false; }
+  // メモリ制限: 256x256以上はスキップ（ESP32ヒープ保護）
+  if (pngW > 512 || pngH > 512) { Serial.println("[PNG] too large, skip"); return false; }
+
+  // channels: ピクセルあたりのバイト数（8bit時）。パレットとグレースケールは1
+  int channels = (colorType == 0) ? 1 : (colorType == 2) ? 3 : (colorType == 3) ? 1 : 4;
+
+  // PLTEチャンク読み取り（colorType=3用）
+  uint8_t palette[256][3];
+  int paletteCount = 0;
+  if (colorType == 3) {
+    int pltPos = pos;
+    while (pltPos + 12 <= imgLen) {
+      uint32_t cLen = (imgBuf[pltPos]<<24)|(imgBuf[pltPos+1]<<16)|(imgBuf[pltPos+2]<<8)|imgBuf[pltPos+3];
+      if (memcmp(imgBuf+pltPos+4, "PLTE", 4) == 0) {
+        paletteCount = cLen / 3;
+        if (paletteCount > 256) paletteCount = 256;
+        for (int i = 0; i < paletteCount; i++) {
+          palette[i][0] = imgBuf[pltPos+8+i*3];
+          palette[i][1] = imgBuf[pltPos+8+i*3+1];
+          palette[i][2] = imgBuf[pltPos+8+i*3+2];
+        }
+        Serial.printf("[PNG] PLTE: %d colors\n", paletteCount);
+        break;
+      } else if (memcmp(imgBuf+pltPos+4, "IDAT", 4) == 0) break;
+      pltPos += 12 + cLen;
+    }
+    if (paletteCount == 0) { Serial.println("[PNG] no PLTE for indexed"); return false; }
+  }
+
+  // IDATチャンクを結合
+  // まずIDATの合計サイズを計算
+  size_t totalIdat = 0;
+  int scanPos = pos;
+  while (scanPos + 12 <= imgLen) {
+    uint32_t cLen = (imgBuf[scanPos]<<24)|(imgBuf[scanPos+1]<<16)|(imgBuf[scanPos+2]<<8)|imgBuf[scanPos+3];
+    if (memcmp(imgBuf+scanPos+4, "IDAT", 4) == 0) totalIdat += cLen;
+    else if (memcmp(imgBuf+scanPos+4, "IEND", 4) == 0) break;
+    scanPos += 12 + cLen;
+    if (scanPos > imgLen) return false;
+  }
+  Serial.printf("[PNG] totalIdat=%d\n", totalIdat);
+  if (totalIdat == 0) { Serial.println("[PNG] no IDAT"); return false; }
+
+  // IDATデータを結合バッファにコピー
+  uint8_t* idatBuf = (uint8_t*)malloc(totalIdat);
+  if (!idatBuf) return false;
+  size_t idatOff = 0;
+  scanPos = pos;
+  while (scanPos + 12 <= imgLen) {
+    uint32_t cLen = (imgBuf[scanPos]<<24)|(imgBuf[scanPos+1]<<16)|(imgBuf[scanPos+2]<<8)|imgBuf[scanPos+3];
+    if (memcmp(imgBuf+scanPos+4, "IDAT", 4) == 0) {
+      memcpy(idatBuf + idatOff, imgBuf + scanPos + 8, cLen);
+      idatOff += cLen;
+    } else if (memcmp(imgBuf+scanPos+4, "IEND", 4) == 0) break;
+    scanPos += 12 + cLen;
+  }
+
+  if (totalIdat < 6) { Serial.println("[PNG] IDAT too small"); free(idatBuf); return false; }
+
+  // デコード先: 各行 = filterByte(1) + ceil(width * channels * bitDepth / 8)
+  size_t pixelBits = pngW * channels * bitDepth;
+  size_t rowBytes = 1 + (pixelBits + 7) / 8;
+  size_t rawSize = rowBytes * pngH;
+  uint8_t* rawBuf = (uint8_t*)malloc(rawSize);
+  Serial.printf("[PNG] rawSize=%d, idatSize=%d, free heap=%d, psram=%d\n", rawSize, totalIdat, ESP.getFreeHeap(), ESP.getFreePsram());
+  if (!rawBuf) { Serial.println("[PNG] rawBuf malloc failed"); free(idatBuf); return false; }
+
+  // tinfl_decompressor をヒープに確保（スタック節約、構造体が~11KB）
+  tinfl_decompressor* decomp = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
+  if (!decomp) { Serial.println("[PNG] decomp malloc failed"); free(idatBuf); free(rawBuf); return false; }
+  tinfl_init(decomp);
+
+  // zlibヘッダごとtinflに渡す（手動スキップしない）
+  const uint8_t* zlibData = idatBuf; // zlib header + deflate + adler32
+  size_t zlibLen = totalIdat;
+  size_t inPos = 0, outPos = 0;
+  tinfl_status status;
+  do {
+    size_t inBytes = zlibLen - inPos;
+    size_t outBytes = rawSize - outPos;
+    int flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    if (inPos + inBytes < zlibLen) flags |= TINFL_FLAG_HAS_MORE_INPUT;
+    status = tinfl_decompress(decomp, zlibData + inPos, &inBytes, rawBuf, rawBuf + outPos, &outBytes, flags);
+    inPos += inBytes;
+    outPos += outBytes;
+  } while (status == TINFL_STATUS_HAS_MORE_OUTPUT || status == TINFL_STATUS_NEEDS_MORE_INPUT);
+  free(decomp);
+  free(idatBuf);
+
+  Serial.printf("[PNG] inflate: outPos=%d, expected=%d, status=%d\n", outPos, rawSize, status);
+  if (status != TINFL_STATUS_DONE || outPos != rawSize) { Serial.println("[PNG] inflate FAILED"); free(rawBuf); return false; }
+
+  // フィルタ復元 & Spriteに描画
+  int stride = (int)(rowBytes - 1); // filterByte除く1行のバイト数
+  uint8_t* prevRow = nullptr;
+  uint8_t* curRow = (uint8_t*)malloc(stride);
+  if (!curRow) { free(rawBuf); return false; }
+  uint8_t* prevRowBuf = (uint8_t*)calloc(stride, 1);
+  if (!prevRowBuf) { free(rawBuf); free(curRow); return false; }
+
+  // 全行フィルタ復元しつつ、間引きでSpriteに描画
+  // pngW x pngH → spriteSize x spriteSize にニアレストネイバー縮小
+  for (uint32_t y = 0; y < pngH; y++) {
+    uint8_t filterType = rawBuf[y * rowBytes];
+    uint8_t* src = rawBuf + y * rowBytes + 1;
+
+    int bpp = max(1, (channels * bitDepth + 7) / 8);
+    for (int i = 0; i < stride; i++) {
+      uint8_t raw = src[i];
+      uint8_t a = (i >= bpp) ? curRow[i - bpp] : 0;
+      uint8_t b = prevRowBuf[i];
+      uint8_t c = (i >= bpp) ? prevRowBuf[i - bpp] : 0;
+
+      switch (filterType) {
+        case 0: curRow[i] = raw; break;
+        case 1: curRow[i] = raw + a; break;
+        case 2: curRow[i] = raw + b; break;
+        case 3: curRow[i] = raw + ((a + b) >> 1); break;
+        case 4: {
+          int p = (int)a + b - c;
+          int pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
+          curRow[i] = raw + ((pa <= pb && pa <= pc) ? a : (pb <= pc) ? b : c);
+          break;
+        }
+        default: curRow[i] = raw; break;
+      }
+    }
+
+    // この行がSpriteのどの行に対応するか（ニアレストネイバー）
+    int destY = y * spriteSize / pngH;
+    // 次の行が同じdestYなら描画スキップ（最後にマッチした行だけ描画）
+    bool shouldDraw = (y == pngH - 1) || ((int)((y+1) * spriteSize / pngH) != destY);
+
+    if (shouldDraw && destY < spriteSize) {
+      for (int dx = 0; dx < spriteSize; dx++) {
+        uint32_t srcX = dx * pngW / spriteSize;
+        uint8_t r, g, b_val;
+        if (colorType == 3) {
+          uint8_t idx;
+          if (bitDepth == 8) { idx = curRow[srcX]; }
+          else {
+            int pixelsPerByte = 8 / bitDepth;
+            int byteIdx = srcX / pixelsPerByte;
+            int bitOffset = (pixelsPerByte - 1 - (srcX % pixelsPerByte)) * bitDepth;
+            idx = (curRow[byteIdx] >> bitOffset) & ((1 << bitDepth) - 1);
+          }
+          if (idx < paletteCount) { r = palette[idx][0]; g = palette[idx][1]; b_val = palette[idx][2]; }
+          else { r = g = b_val = 0; }
+        } else if (colorType == 0) { r = g = b_val = curRow[srcX]; }
+        else { r = curRow[srcX*channels]; g = curRow[srcX*channels+1]; b_val = curRow[srcX*channels+2]; }
+        sprite.drawPixel(dx, destY, sprite.color565(r, g, b_val));
+      }
+    }
+
+    memcpy(prevRowBuf, curRow, stride);
+    if (y % 50 == 0) yield();
+  }
+
+  free(curRow);
+  free(prevRowBuf);
+  free(rawBuf);
+  return true;
+}
+
 // --- JPEG画像ダウンロード＆デコード ---
 // Spriteに描画してからpixel読み出しで32x32に縮小
 bool downloadIcon(MetaEntry* meta) {
   if (meta->pictureUrl.length() == 0) return false;
   if (meta->iconPoolIdx >= 0) return true; // 既に取得済み
   if (meta->iconFailed) return false;
-  
+
   int poolIdx = allocIconPool();
   if (poolIdx < 0) return false; // プール満杯
-  
+
   // HTTPS画像ダウンロード
   WiFiClientSecure client;
   client.setInsecure(); // 証明書検証スキップ
   HTTPClient http;
-  
+
   http.setTimeout(5000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  
+
   if (!http.begin(client, meta->pictureUrl)) {
+    Serial.printf("[ICON] http.begin failed: %s\n", meta->pictureUrl.c_str());
     meta->iconFailed = true;
     iconPoolUsed[poolIdx] = false;
     return false;
   }
-  
+
   int httpCode = http.GET();
   if (httpCode != 200) {
+    Serial.printf("[ICON] HTTP %d: %s\n", httpCode, meta->pictureUrl.c_str());
     http.end();
     meta->iconFailed = true;
     iconPoolUsed[poolIdx] = false;
     return false;
   }
-  
+
   int contentLen = http.getSize();
-  if (contentLen > 100000 || contentLen == 0) {
-    // 大きすぎる画像はスキップ（100KB制限）
+  Serial.printf("[ICON] contentLen: %d\n", contentLen);
+  if (contentLen > 500000 || contentLen == 0) {
+    Serial.printf("[ICON] size skip: %d\n", contentLen);
     http.end();
     meta->iconFailed = true;
     iconPoolUsed[poolIdx] = false;
     return false;
   }
-  
+
   // 画像データをバッファに読み込み
   uint8_t* imgBuf = (uint8_t*)malloc(contentLen > 0 ? contentLen : 50000);
   if (!imgBuf) {
@@ -181,7 +425,7 @@ bool downloadIcon(MetaEntry* meta) {
     iconPoolUsed[poolIdx] = false;
     return false;
   }
-  
+
   WiFiClient* stream = http.getStreamPtr();
   int totalRead = 0;
   while (totalRead < (contentLen > 0 ? contentLen : 50000) && http.connected()) {
@@ -196,14 +440,14 @@ bool downloadIcon(MetaEntry* meta) {
     yield();
   }
   http.end();
-  
+
   if (totalRead < 100) {
     free(imgBuf);
     meta->iconFailed = true;
     iconPoolUsed[poolIdx] = false;
     return false;
   }
-  
+
   // Spriteに描画（元サイズでデコード→32x32にリサンプル）
   // まず大きめのSpriteにJPEGデコード
   TFT_eSprite sprite = TFT_eSprite(&M5.Lcd);
@@ -211,12 +455,42 @@ bool downloadIcon(MetaEntry* meta) {
   int spriteSize = 128;
   sprite.createSprite(spriteSize, spriteSize);
   sprite.fillSprite(BLACK);
-  
-  // 先頭バイトでJPEG判定（PNGやその他はM5Core2 0.1.9では非対応）
+
+  // 先頭バイトで画像形式判定
+  Serial.printf("[ICON] format: %02X %02X, size: %d, url: %s\n", imgBuf[0], imgBuf[1], totalRead, meta->pictureUrl.c_str());
   if (imgBuf[0] == 0xFF && imgBuf[1] == 0xD8) {
+    // JPEG
+    Serial.println("[ICON] JPEG decode start");
     sprite.drawJpg(imgBuf, totalRead, 0, 0, spriteSize, spriteSize);
+    Serial.println("[ICON] JPEG decode done");
+  } else if (imgBuf[0] == 0x89 && imgBuf[1] == 0x50) {
+    // PNG
+    Serial.println("[ICON] PNG decode start");
+    if (!decodePngToSprite(imgBuf, totalRead, sprite, spriteSize)) {
+      Serial.println("[ICON] PNG decode FAILED");
+      free(imgBuf);
+      sprite.deleteSprite();
+      meta->iconFailed = true;
+      iconPoolUsed[poolIdx] = false;
+      return false;
+    }
+  } else if (imgBuf[0] == 0x52 && imgBuf[1] == 0x49) {
+    // WebP (RIFF header) - 直接ICON_SIZEにスケーリングデコード
+    Serial.println("[ICON] WebP decode start");
+    sprite.deleteSprite();
+    spriteSize = ICON_SIZE; // 32x32
+    sprite.createSprite(spriteSize, spriteSize);
+    sprite.fillSprite(BLACK);
+    if (!decodeWebpToSprite(imgBuf, totalRead, sprite, spriteSize)) {
+      Serial.println("[ICON] WebP decode FAILED");
+      free(imgBuf);
+      sprite.deleteSprite();
+      meta->iconFailed = true;
+      iconPoolUsed[poolIdx] = false;
+      return false;
+    }
   } else {
-    // PNG/WebP等は未対応 → カラーブロック維持
+    // 未対応形式 → カラーブロック維持
     free(imgBuf);
     sprite.deleteSprite();
     meta->iconFailed = true;
@@ -224,16 +498,17 @@ bool downloadIcon(MetaEntry* meta) {
     return false;
   }
   free(imgBuf);
-  
-  // 128x128 → 32x32 にニアレストネイバーで縮小
+
+  // spriteSize x spriteSize → 32x32 にニアレストネイバーで縮小
+  // pushImageはバイトスワップされたRGB565を期待する場合があるのでswap
   for (int y = 0; y < ICON_SIZE; y++) {
     for (int x = 0; x < ICON_SIZE; x++) {
       int srcX = x * spriteSize / ICON_SIZE;
       int srcY = y * spriteSize / ICON_SIZE;
-      iconPool[poolIdx][y * ICON_SIZE + x] = sprite.readPixel(srcX, srcY);
+      uint16_t px = sprite.readPixel(srcX, srcY);
+      iconPool[poolIdx][y * ICON_SIZE + x] = (px >> 8) | (px << 8); // バイトスワップ
     }
   }
-  
   sprite.deleteSprite();
   meta->iconPoolIdx = poolIdx;
   return true;
@@ -249,11 +524,11 @@ int efontDrawChar(int x, int y, uint16_t utf16, uint16_t color) {
     M5.Lcd.print(c);
     return 12;
   }
-  
+
   byte font[32];
   memset(font, 0, 32);
   getefontData(font, utf16);
-  
+
   for (int row = 0; row < 16; row++) {
     for (int col = 0; col < 16; col++) {
       int byteIndex = row * 2 + col / 8;
@@ -271,7 +546,7 @@ int efontDrawString(int x, int y, const String& str, uint16_t color, int maxWidt
   int cy = y;
   int line = 0;
   char* p = (char*)str.c_str();
-  
+
   while (*p && line < maxLines) {
     uint16_t utf16;
     p = efontUFT8toUTF16(&utf16, p);
@@ -360,21 +635,21 @@ void drawTimeline() {
   for (int i = 0; i < postCount && i < MAX_POSTS; i++) {
     if (y > 225) break;
     if (i > 0) M5.Lcd.drawLine(5, y - 2, 315, y - 2, TFT_DARKGREY);
-    
+
     Post& p = posts[i];
     MetaEntry* meta = findMeta(p.pubkey);
     String name = (meta && meta->displayName.length() > 0)
       ? meta->displayName : p.pubkey.substring(0, 8) + "...";
     String timeStr = formatTime(p.created_at);
-    
+
     drawIcon(5, y, meta, name);
     efontDrawString(40, y, name, CYAN, 200, 1);
-    
+
     M5.Lcd.setTextSize(1);
     M5.Lcd.setTextColor(TFT_DARKGREY);
     M5.Lcd.setCursor(248, y + 4);
     M5.Lcd.print(timeStr.c_str());
-    
+
     int h = efontDrawString(40, y + 17, p.content, WHITE, 275, 2);
     y += 17 + h + 4;
   }
@@ -433,13 +708,13 @@ void handleEvent(uint8_t* payload, size_t length) {
   if (length > 4096) return;
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
-  
+
   const char* type = doc[0];
   if (!type) return;
-  
+
   if (strcmp(type, "EVENT") == 0) {
     int kind = doc[2]["kind"] | -1;
-    
+
     if (kind == 0) {
       const char* pubkey = doc[2]["pubkey"];
       const char* content = doc[2]["content"];
@@ -459,18 +734,18 @@ void handleEvent(uint8_t* payload, size_t length) {
       const char* content = doc[2]["content"];
       const char* pubkey = doc[2]["pubkey"];
       unsigned long created_at = doc[2]["created_at"] | 0;
-      
+
       if (content && pubkey) {
         String post = String(content);
         post.replace("\n", " ");
         if (post.length() > 200) post = post.substring(0, 197) + "...";
-        
+
         for (int i = MAX_POSTS - 1; i > 0; i--) posts[i] = posts[i - 1];
         posts[0].content = post;
         posts[0].pubkey = String(pubkey);
         posts[0].created_at = created_at;
         if (postCount < MAX_POSTS) postCount++;
-        
+
         requestMeta(String(pubkey));
         drawTimeline();
       }
@@ -577,10 +852,10 @@ void setupWebOTA() {
 void setup() {
   M5.begin();
   M5.Lcd.fillScreen(BLACK);
-  
+
   // アイコンプール初期化
   memset(iconPoolUsed, 0, sizeof(iconPoolUsed));
-  
+
   drawHeader();
   drawStatus("Connecting WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -596,7 +871,7 @@ void setup() {
   }
   wifiReady = true;
   setupWebOTA();
-  
+
   M5.Lcd.fillRect(0, 30, 320, 200, BLACK);
   efontDrawString(30, 50, String("noscli-core2"), WHITE, 280, 1);
   M5.Lcd.setTextSize(2);
@@ -606,7 +881,7 @@ void setup() {
   M5.Lcd.print(WiFi.localIP());
   efontDrawString(30, 150, String("タッチでリレーに接続"), GREEN, 280, 1);
   drawStatus("WiFi OK / OTA ready");
-  
+
   delay(500);
   M5.update();
   while (M5.Touch.ispressed()) {
@@ -620,7 +895,7 @@ void setup() {
 void loop() {
   M5.update();
   if (wifiReady) server.handleClient();
-  
+
   if (!relayStarted) {
     if (wifiReady && M5.Touch.ispressed()) {
       relayStarted = true;

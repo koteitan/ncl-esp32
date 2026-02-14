@@ -1,0 +1,26 @@
+{
+  "name": "libwebp",
+  "version": "1.5.0",
+  "build": {
+    "flags": [
+      "-I../../lib/libwebp/include",
+      "-I../../lib/libwebp",
+      "-DHAVE_CONFIG_H",
+      "-DWEBP_USE_THREAD=0"
+    ],
+    "srcDir": "src",
+    "srcFilter": [
+      "+<dec/>",
+      "+<dsp/>",
+      "+<utils/>",
+      "-<dsp/*neon*>",
+      "-<dsp/*sse*>",
+      "-<dsp/*mips*>",
+      "-<dsp/*msa*>",
+      "-<dsp/*avx*>",
+      "-<dsp/cost*>",
+      "-<dsp/enc*>",
+      "-<dsp/lossless_enc*>"
+    ]
+  }
+}
