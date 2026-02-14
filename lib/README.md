@@ -1,26 +1,5 @@
 # Libraries
 
-## libjpeg (IJG libjpeg 9f)
-- Source: http://www.ijg.org/
-- Decode-only (no encoder files)
-- Used for **progressive JPEG** 1/8 scale decoding
-- Baseline JPEG is handled by M5Stack's built-in `drawJpg`
-- ESP32 porting notes:
-  - `jconfig.h`: minimal config for ESP32
-  - `jmorecfg.h`: modified boolean handling (Arduino defines `boolean` as `bool` 1byte, libjpeg needs `int` 4bytes — struct size mismatch causes abort)
-  - `jmemnobs.c`: uses PSRAM via `heap_caps_malloc(MALLOC_CAP_SPIRAM)` for large DCT coefficient buffers
-  - `main.cpp`: `#pragma push_macro("boolean")` to temporarily redefine boolean=int during jpeglib.h inclusion
-  - setjmp/longjmp error handler to prevent abort() on decode failure (ESP32 reboots on abort)
-
-## libwebp (Google libwebp 1.5.0)
-- Source: https://github.com/nicestrudoc/libwebp (decode-only subset)
-- Used for **WebP** image decoding with direct 32x32 scaling via `WebPDecoderConfig.options.use_scaling`
-- Supports VP8, VP8L (lossless), VP8X (extended format with ICCP profiles)
-- ESP32 porting notes:
-  - `HAVE_CONFIG_H` defined to disable SSE/NEON auto-detection on ESP32
-  - Encoder and platform-specific SIMD files excluded via `library.json` srcFilter
-  - `utils.c`: uses PSRAM via `heap_caps_malloc/calloc(MALLOC_CAP_SPIRAM)` for internal decode buffers (1105x1105 images need several MB)
-
 ## 画像デコーダ一覧
 
 | 形式 | デコーダ | 自作/外部 | 備考 |
@@ -75,3 +54,26 @@
 ### chunked transfer encoding
 - **問題**: `getString()` がぬるバイトで切断、`getStream()` がchunkedデコードしない
 - **対処**: カスタム `BufStream` クラス + `writeToStream()` でバイナリ安全にダウンロード
+
+---
+
+## libjpeg (IJG libjpeg 9f)
+- Source: http://www.ijg.org/
+- Decode-only (no encoder files)
+- Used for **progressive JPEG** 1/8 scale decoding
+- Baseline JPEG is handled by M5Stack's built-in `drawJpg`
+- ESP32 porting notes:
+  - `jconfig.h`: minimal config for ESP32
+  - `jmorecfg.h`: modified boolean handling (Arduino defines `boolean` as `bool` 1byte, libjpeg needs `int` 4bytes — struct size mismatch causes abort)
+  - `jmemnobs.c`: uses PSRAM via `heap_caps_malloc(MALLOC_CAP_SPIRAM)` for large DCT coefficient buffers
+  - `main.cpp`: `#pragma push_macro("boolean")` to temporarily redefine boolean=int during jpeglib.h inclusion
+  - setjmp/longjmp error handler to prevent abort() on decode failure (ESP32 reboots on abort)
+
+## libwebp (Google libwebp 1.5.0)
+- Source: https://github.com/nicestrudoc/libwebp (decode-only subset)
+- Used for **WebP** image decoding with direct 32x32 scaling via `WebPDecoderConfig.options.use_scaling`
+- Supports VP8, VP8L (lossless), VP8X (extended format with ICCP profiles)
+- ESP32 porting notes:
+  - `HAVE_CONFIG_H` defined to disable SSE/NEON auto-detection on ESP32
+  - Encoder and platform-specific SIMD files excluded via `library.json` srcFilter
+  - `utils.c`: uses PSRAM via `heap_caps_malloc/calloc(MALLOC_CAP_SPIRAM)` for internal decode buffers (1105x1105 images need several MB)
