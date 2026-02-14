@@ -29,7 +29,18 @@ extern void free JPP((void *ptr));
 /* ESP32: Use PSRAM for libjpeg allocations (progressive JPEG needs lots of memory) */
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
-#define JPEG_MALLOC(sz) heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#include "esp32-hal.h"  /* for Serial-like logging via ets_printf */
+#include "rom/ets_sys.h"
+static void* jpeg_psram_malloc(size_t sz) {
+  void* p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p && sz > 0) {
+    /* fallback to any available memory */
+    p = malloc(sz);
+    ets_printf("[JPEG-MEM] PSRAM fail %d, fallback=%p\n", sz, p);
+  }
+  return p;
+}
+#define JPEG_MALLOC(sz) jpeg_psram_malloc(sz)
 #else
 #define JPEG_MALLOC(sz) malloc(sz)
 #endif

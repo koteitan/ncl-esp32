@@ -486,6 +486,15 @@ bool downloadIcon(MetaEntry* meta) {
       }
     }
     Serial.printf("[JPEG] original: %dx%d%s\n", jpgW, jpgH, progressiveJpeg ? " (progressive)" : "");
+    if (progressiveJpeg && (jpgW > 1000 || jpgH > 1000)) {
+      // 大きすぎるプログレッシブJPEGはDCT係数バッファ(数MB)がPSRAMに入りきらない
+      Serial.printf("[JPEG] progressive %dx%d too large, skipping\n", jpgW, jpgH);
+      free(imgBuf);
+      sprite.deleteSprite();
+      meta->iconFailed = true;
+      iconPoolUsed[poolIdx] = false;
+      return false;
+    }
     if (progressiveJpeg) {
       Serial.printf("[JPEG] progressive - using libjpeg 1/8 scale, heap=%d psram=%d\n", ESP.getFreeHeap(), ESP.getFreePsram());
       // libjpeg: メモリソースからデコード（1/8スケール）
