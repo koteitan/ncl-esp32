@@ -27,9 +27,10 @@ extern "C" {
 #pragma pop_macro("boolean")
 
 #define VERSION "v1.5.0"
-#define RELAY_HOST "yabu.me"
-#define RELAY_PORT 443
-#define RELAY_PATH "/"
+// RELAY_HOST, RELAY_PORT, RELAY_PATH は secrets.h で定義
+// 例: #define RELAY_HOST "yabu.me"
+//     #define RELAY_PORT 443
+//     #define RELAY_PATH "/"
 
 WebSocketsClient webSocket;
 WebServer server(80);
