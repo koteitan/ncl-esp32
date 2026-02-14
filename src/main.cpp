@@ -255,31 +255,37 @@ bool decodePngToSprite(const uint8_t* imgBuf, int imgLen, TFT_eSprite& sprite, i
   }
 
   // IDATチャンクを結合
-  // まずIDATの合計サイズを計算
+  // まずIDATの合計サイズを計算（切り詰められたPNG対応）
   size_t totalIdat = 0;
   int scanPos = pos;
-  while (scanPos + 12 <= imgLen) {
+  while (scanPos + 8 <= imgLen) {
     uint32_t cLen = (imgBuf[scanPos]<<24)|(imgBuf[scanPos+1]<<16)|(imgBuf[scanPos+2]<<8)|imgBuf[scanPos+3];
-    if (memcmp(imgBuf+scanPos+4, "IDAT", 4) == 0) totalIdat += cLen;
+    if (memcmp(imgBuf+scanPos+4, "IDAT", 4) == 0) {
+      // 実際に読めるデータ量（ファイル末尾で切れてる場合）
+      size_t avail = (scanPos + 8 + cLen <= (uint32_t)imgLen) ? cLen : (imgLen - scanPos - 8);
+      totalIdat += avail;
+    }
     else if (memcmp(imgBuf+scanPos+4, "IEND", 4) == 0) break;
     scanPos += 12 + cLen;
-    if (scanPos > imgLen) return false;
+    if (scanPos > imgLen) break; // 切り詰めPNG: ループ終了（エラーにしない）
   }
   Serial.printf("[PNG] totalIdat=%d\n", totalIdat);
   if (totalIdat == 0) { Serial.println("[PNG] no IDAT"); return false; }
 
-  // IDATデータを結合バッファにコピー
+  // IDATデータを結合バッファにコピー（切り詰め対応）
   uint8_t* idatBuf = (uint8_t*)malloc(totalIdat);
   if (!idatBuf) return false;
   size_t idatOff = 0;
   scanPos = pos;
-  while (scanPos + 12 <= imgLen) {
+  while (scanPos + 8 <= imgLen) {
     uint32_t cLen = (imgBuf[scanPos]<<24)|(imgBuf[scanPos+1]<<16)|(imgBuf[scanPos+2]<<8)|imgBuf[scanPos+3];
     if (memcmp(imgBuf+scanPos+4, "IDAT", 4) == 0) {
-      memcpy(idatBuf + idatOff, imgBuf + scanPos + 8, cLen);
-      idatOff += cLen;
+      size_t avail = (scanPos + 8 + cLen <= (uint32_t)imgLen) ? cLen : (imgLen - scanPos - 8);
+      memcpy(idatBuf + idatOff, imgBuf + scanPos + 8, avail);
+      idatOff += avail;
     } else if (memcmp(imgBuf+scanPos+4, "IEND", 4) == 0) break;
     scanPos += 12 + cLen;
+    if (scanPos > imgLen) break;
   }
 
   if (totalIdat < 6) { Serial.println("[PNG] IDAT too small"); free(idatBuf); return false; }
@@ -410,8 +416,9 @@ bool decodePngToSprite(const uint8_t* imgBuf, int imgLen, TFT_eSprite& sprite, i
   free(prevRowBuf);
 
   Serial.printf("[PNG] streaming decode: %d/%d rows, status=%d\n", curY, pngH, status);
-  if (!decodeOk || curY < pngH) { Serial.println("[PNG] decode incomplete"); return false; }
-  return true;
+  if (!decodeOk && curY == 0) { Serial.println("[PNG] decode failed, no rows"); return false; }
+  if (curY < pngH) { Serial.printf("[PNG] partial decode: %d/%d rows (truncated PNG?)\n", curY, pngH); }
+  return true; // 部分デコードでもOK（切り詰めPNG対応）
 }
 
 // --- JPEG画像ダウンロード＆デコード ---
@@ -930,7 +937,7 @@ void sendSubscribe() {
 bool iconDownloadPending = false;
 
 void handleEvent(uint8_t* payload, size_t length) {
-  if (length > 4096) return;
+  if (length > 16384) return; // data:URI入りkind:0対応（旧4096→16384）
   JsonDocument doc;
   if (deserializeJson(doc, payload, length)) return;
 
@@ -1106,6 +1113,8 @@ void setup() {
   M5.Lcd.print(WiFi.localIP());
   efontDrawString(30, 150, String("タッチでリレーに接続"), GREEN, 280, 1);
   drawStatus("WiFi OK / OTA ready");
+
+  // テストコード削除済み
 
   delay(500);
   M5.update();
